@@ -1,0 +1,14 @@
+⁠ _manifest_.py ⁠
+⁠ python
+{
+    'name': 'My Test Module',
+    'version': '1.0',
+    'depends': ['base'],
+    'data': [],
+    'installable': True,
+}
+ ⁠
+
+⁠ _init_.py ⁠
+⁠ python
+from . import models
