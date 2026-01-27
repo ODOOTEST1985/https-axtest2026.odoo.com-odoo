@@ -1,0 +1,163 @@
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
+
+class AccountMove(models.Model):
+    _inherit = "account.move"
+
+    x_external_id = fields.Char(string="External ID", copy=False, index=True)
+    x_jv_name = fields.Char(string="JV Name", copy=False)
+
+    @api.model
+    def _find_account_by_code(self, code):
+        return self.env['account.account'].sudo().search([('code', '=', code)], limit=1)
+
+    @api.model
+    def _build_lines_from_summary(self, payload):
+        """
+        Build move lines when payload contains summary fields (amount_sent + tax)
+        Expects debit_account_code and credit_account_code; tax_account_code optional.
+        Behavior:
+         - debit: amount_sent + tax -> debit_account_code
+         - credit: amount_sent -> credit_account_code
+         - credit: tax -> tax_account_code (if tax > 0)
+        """
+        amount = float(payload.get('amount_sent') or 0.0)
+        tax = float(payload.get('tax') or 0.0)
+        debit_account_code = payload.get('debit_account_code')
+        credit_account_code = payload.get('credit_account_code')
+        tax_account_code = payload.get('tax_account_code')
+
+        if not debit_account_code or not credit_account_code:
+            raise UserError(_("When using summary mode you must provide debit_account_code and credit_account_code"))
+
+        debit_account = self._find_account_by_code(debit_account_code)
+        if not debit_account:
+            raise UserError(_("Debit account with code %s not found") % debit_account_code)
+        credit_account = self._find_account_by_code(credit_account_code)
+        if not credit_account:
+            raise UserError(_("Credit account with code %s not found") % credit_account_code)
+
+        lines = []
+        # debit total (amount + tax)
+        lines.append((0, 0, {
+            'account_id': debit_account.id,
+            'debit': amount + tax,
+            'credit': 0.0,
+            'name': payload.get('ref') or 'Agent Money Send',
+        }))
+        # credit amount_sent
+        lines.append((0, 0, {
+            'account_id': credit_account.id,
+            'debit': 0.0,
+            'credit': amount,
+            'name': payload.get('ref') or 'Agent Money Send',
+        }))
+        # tax line if provided
+        if tax > 0:
+            if not tax_account_code:
+                raise UserError(_("tax_account_code is required when tax > 0"))
+            tax_account = self._find_account_by_code(tax_account_code)
+            if not tax_account:
+                raise UserError(_("Tax account with code %s not found") % tax_account_code)
+            lines.append((0, 0, {
+                'account_id': tax_account.id,
+                'debit': 0.0,
+                'credit': tax,
+                'name': payload.get('ref') or 'Tax',
+            }))
+        return lines
+
+    @api.model
+    def create_or_update_from_external(self, payload):
+        """
+        payload keys supported (summary or detailed):
+         - external_id (required)
+         - jv_name (optional, default "Agent Money Send")
+         - journal_code (required)
+         - ref
+         - invoice_bill_date
+         - invoice_bill_due_date
+         - line_items (optional) -> if present, used as detailed lines
+         - amount_sent, tax, debit_account_code, credit_account_code, tax_account_code for summary mode
+        """
+        external_id = payload.get('external_id')
+        if not external_id:
+            raise UserError(_("external_id is required for idempotency"))
+
+        journal_code = payload.get('journal_code')
+        if not journal_code:
+            raise UserError(_("journal_code is required"))
+
+        journal = self.env['account.journal'].sudo().search([('code', '=', journal_code)], limit=1)
+        if not journal:
+            raise UserError(_("Journal with code %s not found") % journal_code)
+
+        # Build lines: detailed mode if line_items provided, else summary mode
+        lines_vals = []
+        if payload.get('line_items'):
+            # existing behavior: map each line
+            partner_model = self.env['res.partner'].sudo()
+            for l in payload.get("line_items", []):
+                account_code = l.get("account_code")
+                if not account_code:
+                    raise UserError(_("Each line must contain account_code"))
+                account = self._find_account_by_code(account_code)
+                if not account:
+                    raise UserError(_("Account with code %s not found") % account_code)
+
+                partner = False
+                partner_ref = l.get("partner_ref")
+                if partner_ref:
+                    partner = partner_model.search([('ref','=',partner_ref)], limit=1)
+                    if not partner:
+                        partner = partner_model.search([('name','ilike',partner_ref)], limit=1)
+
+                line = {
+                    'account_id': account.id,
+                    'debit': float(l.get('debit') or 0.0),
+                    'credit': float(l.get('credit') or 0.0),
+                    'name': l.get('description') or l.get('name') or payload.get('ref') or '/',
+                    'partner_id': partner.id if partner else False,
+                }
+                # optional taxes by code
+                tax_codes = l.get('tax_codes') or l.get('tax_ids')
+                if tax_codes:
+                    taxes = self.env['account.tax'].sudo().search([('name','in', tax_codes)])  # simple lookup by name
+                    line['tax_ids'] = [(6, 0, taxes.ids)]
+                lines_vals.append((0, 0, line))
+        else:
+            # summary mode: construct lines automatically
+            lines_vals = self._build_lines_from_summary(payload)
+
+        vals = {
+            'journal_id': journal.id,
+            'date': payload.get('invoice_bill_date') or payload.get('date'),
+            'ref': payload.get('ref'),
+            'line_ids': lines_vals,
+            'x_external_id': external_id,
+            'x_jv_name': payload.get('jv_name') or 'Agent Money Send',
+            'move_type': 'entry',
+            # invoice fields if present
+            'invoice_date': payload.get('invoice_bill_date') or False,
+            'invoice_date_due': payload.get('invoice_bill_due_date') or False,
+        }
+
+        # If exists, update (replace lines) else create
+        existing = self.search([('x_external_id', '=', external_id)], limit=1)
+        if existing:
+            # Replace lines and update meta fields
+            existing.sudo().write({
+                'date': vals['date'],
+                'ref': vals['ref'],
+                'invoice_date': vals['invoice_date'],
+                'invoice_date_due': vals['invoice_date_due'],
+                'line_ids': [(5, 0, 0)] + vals['line_ids'],
+                'x_jv_name': vals['x_jv_name'],
+            })
+            move = existing
+            created = False
+        else:
+            move = self.sudo().create(vals)
+            created = True
+
+        return {'created': created, 'odoo_id': move.id}
